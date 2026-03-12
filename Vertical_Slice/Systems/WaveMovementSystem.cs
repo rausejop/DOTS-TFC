@@ -30,26 +30,18 @@ partial struct WaveMovementSystem : ISystem
     public void OnUpdate(ref SystemState state)
     {
         //Find the Castle position (if it exists)
-        float3 castlePosition = float3.zero;
-        bool castleExists = false;
-
-        foreach ((
-            RefRO<LocalTransform> castleTransform,
-            RefRO<CastleTag> castleTag)
-                in SystemAPI.Query<
-                RefRO<LocalTransform>,
-                RefRO<CastleTag>>())
-        {
-            castlePosition = castleTransform.ValueRO.Position;
-            castleExists = true;
-            break; //Singleton — only one Castle expected
-        }
-
-        if (!castleExists)
+        if (!SystemAPI.TryGetSingletonEntity<CastleTag>(out Entity castleEntity))
         {
             //No Castle — enemies have nothing to advance toward
             return;
         }
+
+        if (!SystemAPI.HasComponent<LocalTransform>(castleEntity))
+        {
+            return;
+        }
+
+        float3 castlePosition = SystemAPI.GetComponent<LocalTransform>(castleEntity).Position;
 
         //Schedule the wave movement job
         new WaveMovementJob

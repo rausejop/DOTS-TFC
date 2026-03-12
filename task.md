@@ -1,19 +1,17 @@
-# DOTS RTS Prototype — Prompt.txt Deliverables
+- [x] Analyze existing systems and design concurrent approaches.
+- [x] Refactor `WaveMovementSystem` to use `SystemAPI.TryGetSingleton` and keep `ScheduleParallel`.
+- [x] Refactor `ResourceGenerationSystem`
+  - [x] Implement `IJobEntity` for overlap sphere calculation.
+  - [x] Create `NativeQueue<float>` to pass generated resources safely.
+  - [x] Implement `IJob` to sum queue items into `PlayerResources` singleton safely.
+- [x] Refactor `SimpleCombatSystem`
+  - [x] Implement `IJobEntity` for combat distance checks.
+  - [x] Create `NativeQueue<int>` to accumulate damage safely from multiple enemies.
+  - [x] Implement `IJob` to dequeue damage and apply it to Castle's `Health` component.
+- [x] Verify there are no race conditions and compilation is successful.
 
-## Part A: Game Design Document
-- [x] Analyse existing codebase (68 C# files)
-- [x] Generate `Game_Design_Document.md`
-
-## Part B: Vertical Slice Code Blueprint
-- [x] Create implementation plan
-- [x] Generate Entity Definitions (4 files)
-  - [x] `CastleTagAuthoring.cs`
-  - [x] `EnemyTagAuthoring.cs`
-  - [x] `ResourceGeneratorAuthoring.cs`
-  - [x] `PlayerResourcesAuthoring.cs`
-- [x] Generate Core Systems (3 files)
-  - [x] `ResourceGenerationSystem.cs`
-  - [x] `WaveMovementSystem.cs`
-  - [x] `SimpleCombatSystem.cs`
-- [x] Generate Build Instructions
-  - [x] `BUILD_INSTRUCTIONS.md`
+# Task Breakdown: Architectural Fix
+- [x] Remove `[NativeDisableParallelForRestriction]` and `ComponentLookup<MeleeAttack>` from `SimpleCombatSystem`.
+- [x] Implement `CombatCheckWithMeleeJob : IJobEntity` with strict `[WithAll(typeof(MeleeAttack))]`.
+- [x] Implement `CombatCheckWithoutMeleeJob : IJobEntity` with strict `[WithNone(typeof(MeleeAttack))]`.
+- [x] Schedule both sequentially dependent jobs with the `ParallelWriter` queue.

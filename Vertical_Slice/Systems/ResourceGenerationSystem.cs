@@ -29,88 +29,149 @@ partial struct ResourceGenerationSystem : ISystem
     [BurstCompile]
     public void OnUpdate(ref SystemState state)
     {
-        //Retrieve the global resource pool singleton
-        RefRW<PlayerResources> playerResources = SystemAPI.GetSingletonRW<PlayerResources>();
-
-        //Register CollisionWorld for physics queries
+        float deltaTime = SystemAPI.Time.DeltaTime;
+        
         PhysicsWorldSingleton physicsWorldSingleton = SystemAPI.GetSingleton<PhysicsWorldSingleton>();
         CollisionWorld collisionWorld = physicsWorldSingleton.CollisionWorld;
 
-        //Reusable hit list (kept external to the loop to avoid excessive allocations)
+        // Use TempJob allocator for the queue since it will be passed to a job
+        NativeQueue<float> generatedResourcesQueue = new NativeQueue<float>(Allocator.TempJob);
+
+        // Schedule parallel job to calculate resources
+        GenerateResourcesJob generateResourcesJob = new GenerateResourcesJob
+        {
+            deltaTime = deltaTime,
+            collisionWorld = collisionWorld,
+            unitsLayer = 1u << GameAssets.UNITS_LAYER,
+            buildingsLayer = 1u << GameAssets.BUILDINGS_LAYER,
+            unitLookup = SystemAPI.GetComponentLookup<Unit>(true),
+            buildingLookup = SystemAPI.GetComponentLookup<Building>(true),
+            resourceQueue = generatedResourcesQueue.AsParallelWriter()
+        };
+        
+        state.Dependency = generateResourcesJob.ScheduleParallel(state.Dependency);
+
+        // Schedule single thread job to sum resources and apply to singleton
+        SumResourcesJob sumResourcesJob = new SumResourcesJob
+        {
+            resourceQueue = generatedResourcesQueue,
+            playerResourcesEntity = SystemAPI.GetSingletonEntity<PlayerResources>(),
+            playerResourcesLookup = SystemAPI.GetComponentLookup<PlayerResources>(false)
+        };
+        
+        state.Dependency = sumResourcesJob.Schedule(state.Dependency);
+
+        // Dispose the queue after the sum job completes
+        generatedResourcesQueue.Dispose(state.Dependency);
+    }
+}
+
+[BurstCompile]
+public partial struct GenerateResourcesJob : IJobEntity
+{
+    public float deltaTime;
+    [ReadOnly] public CollisionWorld collisionWorld;
+    public uint unitsLayer;
+    public uint buildingsLayer;
+    [ReadOnly] public ComponentLookup<Unit> unitLookup;
+    [ReadOnly] public ComponentLookup<Building> buildingLookup;
+    public NativeQueue<float>.ParallelWriter resourceQueue;
+
+    public void Execute(
+        Entity entity,
+        in LocalTransform localTransform,
+        ref ResourceGenerator resourceGenerator)
+    {
+        //Timer tick
+        resourceGenerator.generationPhaseTime += deltaTime;
+        if (resourceGenerator.generationPhaseTime < resourceGenerator.generationInterval)
+        {
+            return;
+        }
+
+        //Reset timer
+        resourceGenerator.generationPhaseTime = 0f;
+
+        //Calculate total influence area (circle: π × r²)
+        float radius = resourceGenerator.influenceRadius;
+        float totalArea = math.PI * radius * radius;
+
+        CollisionFilter collisionFilter = new CollisionFilter
+        {
+            BelongsTo = ~0u, //All layers
+            CollidesWith = unitsLayer | buildingsLayer,
+            GroupIndex = 0
+        };
+
+        float occupiedArea = 0f;
+        
+        // NativeList allocated with Temp since it's local to the job execution
         NativeList<DistanceHit> distanceHitList = new NativeList<DistanceHit>(Allocator.Temp);
 
-        float deltaTime = SystemAPI.Time.DeltaTime;
-
-        foreach ((
-            RefRO<LocalTransform> localTransform,
-            RefRW<ResourceGenerator> resourceGenerator)
-                in SystemAPI.Query<
-                RefRO<LocalTransform>,
-                RefRW<ResourceGenerator>>())
+        if (collisionWorld.OverlapSphere(
+                localTransform.Position,
+                radius,
+                ref distanceHitList,
+                collisionFilter))
         {
-            //Timer tick
-            resourceGenerator.ValueRW.generationPhaseTime += deltaTime;
-            if (resourceGenerator.ValueRO.generationPhaseTime < resourceGenerator.ValueRO.generationInterval)
+            foreach (DistanceHit distanceHit in distanceHitList)
             {
-                continue;
-            }
+                // Accumulate occupied area from detected entities' collider radii
+                float entityRadius = 0f;
 
-            //Reset timer
-            resourceGenerator.ValueRW.generationPhaseTime = 0f;
-
-            //Calculate total influence area (circle: π × r²)
-            float radius = resourceGenerator.ValueRO.influenceRadius;
-            float totalArea = math.PI * radius * radius;
-
-            //Scan for nearby entities within the influence radius
-            distanceHitList.Clear();
-            CollisionFilter collisionFilter = new CollisionFilter
-            {
-                BelongsTo = ~0u, //All layers
-                CollidesWith = 1u << GameAssets.UNITS_LAYER | 1u << GameAssets.BUILDINGS_LAYER,
-                GroupIndex = 0
-            };
-
-            float occupiedArea = 0f;
-
-            if (collisionWorld.OverlapSphere(
-                    localTransform.ValueRO.Position,
-                    radius,
-                    ref distanceHitList,
-                    collisionFilter))
-            {
-                foreach (DistanceHit distanceHit in distanceHitList)
+                if (unitLookup.HasComponent(distanceHit.Entity))
                 {
-                    if (!EntityUtil.ExistsAndPersists(ref state, distanceHit.Entity))
-                    {
-                        continue;
-                    }
-
-                    //Accumulate occupied area from detected entities' collider radii
-                    float entityRadius = 0f;
-
-                    if (SystemAPI.HasComponent<Unit>(distanceHit.Entity))
-                    {
-                        entityRadius = SystemAPI.GetComponent<Unit>(distanceHit.Entity).colliderOffsetRadius;
-                    }
-                    else if (SystemAPI.HasComponent<Building>(distanceHit.Entity))
-                    {
-                        entityRadius = SystemAPI.GetComponent<Building>(distanceHit.Entity).colliderOffsetRadius;
-                    }
-
-                    //Approximate occupied area as a circle (π × r²)
-                    occupiedArea += math.PI * entityRadius * entityRadius;
+                    entityRadius = unitLookup[distanceHit.Entity].colliderOffsetRadius;
                 }
+                else if (buildingLookup.HasComponent(distanceHit.Entity))
+                {
+                    entityRadius = buildingLookup[distanceHit.Entity].colliderOffsetRadius;
+                }
+                else
+                {
+                    continue;
+                }
+
+                //Approximate occupied area as a circle (π × r²)
+                occupiedArea += math.PI * entityRadius * entityRadius;
             }
+        }
+        
+        distanceHitList.Dispose();
 
-            //Calculate free area fraction (clamped to [0, 1])
-            float freeAreaFraction = math.saturate((totalArea - occupiedArea) / totalArea);
+        //Calculate free area fraction (clamped to [0, 1])
+        float freeAreaFraction = math.saturate((totalArea - occupiedArea) / totalArea);
 
-            //Calculate generated resources for this tick
-            float generatedResources = resourceGenerator.ValueRO.baseOutputRate * freeAreaFraction;
+        //Calculate generated resources for this tick
+        float generatedResources = resourceGenerator.baseOutputRate * freeAreaFraction;
 
-            //Deposit into the global resource pool
-            playerResources.ValueRW.currentResources += generatedResources;
+        if (generatedResources > 0f)
+        {
+            resourceQueue.Enqueue(generatedResources);
+        }
+    }
+}
+
+[BurstCompile]
+public struct SumResourcesJob : IJob
+{
+    public NativeQueue<float> resourceQueue;
+    public Entity playerResourcesEntity;
+    public ComponentLookup<PlayerResources> playerResourcesLookup;
+
+    public void Execute()
+    {
+        float totalGenerated = 0f;
+        while (resourceQueue.TryDequeue(out float result))
+        {
+            totalGenerated += result;
+        }
+
+        if (totalGenerated > 0f)
+        {
+            PlayerResources resources = playerResourcesLookup[playerResourcesEntity];
+            resources.currentResources += totalGenerated;
+            playerResourcesLookup[playerResourcesEntity] = resources;
         }
     }
 }

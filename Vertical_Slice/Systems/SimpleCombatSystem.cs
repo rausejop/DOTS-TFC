@@ -36,97 +36,152 @@ partial struct SimpleCombatSystem : ISystem
     [BurstCompile]
     public void OnUpdate(ref SystemState state)
     {
-        //Find the Castle entity for damage application
-        Entity castleEntity = Entity.Null;
-        float3 castlePosition = float3.zero;
-
-        foreach ((
-            RefRO<LocalTransform> castleTransform,
-            RefRO<CastleTag> castleTag,
-            Entity entity)
-                in SystemAPI.Query<
-                RefRO<LocalTransform>,
-                RefRO<CastleTag>>().
-                WithEntityAccess())
-        {
-            castleEntity = entity;
-            castlePosition = castleTransform.ValueRO.Position;
-            break; //Singleton
-        }
-
-        if (castleEntity == Entity.Null)
+        if (!SystemAPI.TryGetSingletonEntity<CastleTag>(out Entity castleEntity))
         {
             return;
         }
 
-        //Check if castle still has health
         if (!SystemAPI.HasComponent<Health>(castleEntity))
         {
             return;
         }
 
-        EntityCommandBuffer ecb =
-            SystemAPI.GetSingleton<EndSimulationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(state.WorldUnmanaged);
-
-        float deltaTime = SystemAPI.Time.DeltaTime;
-
-        //Query all enemy-tagged units to check collision with the Castle
-        foreach ((
-            RefRO<LocalTransform> localTransform,
-            RefRO<EnemyTag> enemyTag,
-            RefRO<Unit> unit,
-            Entity entity)
-                in SystemAPI.Query<
-                RefRO<LocalTransform>,
-                RefRO<EnemyTag>,
-                RefRO<Unit>>().
-                WithEntityAccess())
+        float3 castlePosition = SystemAPI.GetComponent<LocalTransform>(castleEntity).Position;
+        float castleColliderOffset = 0f;
+        if (SystemAPI.HasComponent<Building>(castleEntity))
         {
-            //Calculate distance to Castle
-            float distanceToCastle = math.distance(localTransform.ValueRO.Position, castlePosition);
+            castleColliderOffset = SystemAPI.GetComponent<Building>(castleEntity).colliderOffsetRadius;
+        }
 
-            //Get Castle's collider offset for proximity check
-            float castleColliderOffset = 0f;
-            if (SystemAPI.HasComponent<Building>(castleEntity))
+        // Use TempJob allocator for the queue
+        NativeQueue<int> damageQueue = new NativeQueue<int>(Allocator.TempJob);
+
+        // 1. Schedule parallel job FOR ENEMIES WITH MELEE ATTACK
+        CombatCheckWithMeleeJob combatWithMeleeJob = new CombatCheckWithMeleeJob
+        {
+            deltaTime = SystemAPI.Time.DeltaTime,
+            castlePosition = castlePosition,
+            castleColliderOffset = castleColliderOffset,
+            damageQueue = damageQueue.AsParallelWriter()
+        };
+        state.Dependency = combatWithMeleeJob.ScheduleParallel(state.Dependency);
+
+        // 2. Schedule parallel job FOR ENEMIES WITHOUT MELEE ATTACK
+        CombatCheckWithoutMeleeJob combatWithoutMeleeJob = new CombatCheckWithoutMeleeJob
+        {
+            castlePosition = castlePosition,
+            castleColliderOffset = castleColliderOffset,
+            damageQueue = damageQueue.AsParallelWriter()
+        };
+        state.Dependency = combatWithoutMeleeJob.ScheduleParallel(state.Dependency);
+
+        // 3. Schedule single thread job to apply damage
+        ApplyDamageJob applyJob = new ApplyDamageJob
+        {
+            castleEntity = castleEntity,
+            healthLookup = SystemAPI.GetComponentLookup<Health>(false),
+            damageQueue = damageQueue
+        };
+        state.Dependency = applyJob.Schedule(state.Dependency);
+
+        // Dispose the queue after the apply damage job completes
+        damageQueue.Dispose(state.Dependency);
+    }
+}
+
+[BurstCompile]
+[WithAll(typeof(MeleeAttack))]
+public partial struct CombatCheckWithMeleeJob : IJobEntity
+{
+    public float deltaTime;
+    public float3 castlePosition;
+    public float castleColliderOffset;
+    
+    public NativeQueue<int>.ParallelWriter damageQueue;
+
+    public void Execute(
+        in LocalTransform localTransform,
+        in EnemyTag enemyTag,
+        in Unit unit,
+        ref MeleeAttack meleeAttack)
+    {
+        //Calculate distance to Castle
+        float distanceToCastle = math.distance(localTransform.Position, castlePosition);
+
+        //Collision check: unit radius + castle radius + a small contact threshold
+        float contactThreshold = 1.5f;
+        float minContactDistance = unit.colliderOffsetRadius + castleColliderOffset + contactThreshold;
+
+        if (distanceToCastle < minContactDistance)
+        {
+            //Respect cooldown timer
+            meleeAttack.attackPhaseTime -= deltaTime;
+            if (meleeAttack.attackPhaseTime > 0)
             {
-                castleColliderOffset = SystemAPI.GetComponent<Building>(castleEntity).colliderOffsetRadius;
+                return;
             }
 
-            //Collision check: unit radius + castle radius + a small contact threshold
-            float contactThreshold = 1.5f;
-            float minContactDistance = unit.ValueRO.colliderOffsetRadius + castleColliderOffset + contactThreshold;
+            meleeAttack.attackPhaseTime = meleeAttack.attackFrequency;
+            int damageAmount = meleeAttack.damageAmount;
+            meleeAttack.onAttack = true; // Flag for visual effects if any
+            
+            damageQueue.Enqueue(damageAmount);
+        }
+    }
+}
 
-            if (distanceToCastle < minContactDistance)
-            {
-                //Enemy is touching the Castle — apply damage
-                //Use MeleeAttack damage if available, otherwise a default value
-                int damageAmount = 1; //Default damage per frame of contact
+[BurstCompile]
+[WithAll(typeof(EnemyTag))]
+[WithNone(typeof(MeleeAttack))]
+public partial struct CombatCheckWithoutMeleeJob : IJobEntity
+{
+    public float3 castlePosition;
+    public float castleColliderOffset;
+    
+    public NativeQueue<int>.ParallelWriter damageQueue;
 
-                if (SystemAPI.HasComponent<MeleeAttack>(entity))
-                {
-                    RefRW<MeleeAttack> meleeAttack = SystemAPI.GetComponentRW<MeleeAttack>(entity);
+    public void Execute(
+        in LocalTransform localTransform,
+        in Unit unit)
+    {
+        //Calculate distance to Castle
+        float distanceToCastle = math.distance(localTransform.Position, castlePosition);
 
-                    //Respect cooldown timer
-                    meleeAttack.ValueRW.attackPhaseTime -= deltaTime;
-                    if (meleeAttack.ValueRO.attackPhaseTime > 0)
-                    {
-                        continue;
-                    }
+        //Collision check: unit radius + castle radius + a small contact threshold
+        float contactThreshold = 1.5f;
+        float minContactDistance = unit.colliderOffsetRadius + castleColliderOffset + contactThreshold;
 
-                    meleeAttack.ValueRW.attackPhaseTime = meleeAttack.ValueRO.attackFrequency;
-                    damageAmount = meleeAttack.ValueRO.damageAmount;
-                    meleeAttack.ValueRW.onAttack = true;
-                }
+        if (distanceToCastle < minContactDistance)
+        {
+            //Enemy is touching the Castle — apply default damage
+            int damageAmount = 1; //Default damage per frame of contact
+            damageQueue.Enqueue(damageAmount);
+        }
+    }
+}
 
-                //Apply damage to Castle
-                RefRW<Health> castleHealth = SystemAPI.GetComponentRW<Health>(castleEntity);
-                castleHealth.ValueRW.currentHealth -= damageAmount;
-                castleHealth.ValueRW.onHealthChanged = true;
+[BurstCompile]
+public struct ApplyDamageJob : IJob
+{
+    public NativeQueue<int> damageQueue;
+    public Entity castleEntity;
+    public ComponentLookup<Health> healthLookup;
 
-                //Optionally: destroy the enemy on contact (siege unit behaviour)
-                //Uncomment the line below for kamikaze-style enemies:
-                // ecb.DestroyEntity(entity);
-            }
+    public void Execute()
+    {
+        int totalDamage = 0;
+        
+        while (damageQueue.TryDequeue(out int result))
+        {
+            totalDamage += result;
+        }
+
+        if (totalDamage > 0 && healthLookup.HasComponent(castleEntity))
+        {
+            Health castleHealth = healthLookup[castleEntity];
+            castleHealth.currentHealth -= totalDamage;
+            castleHealth.onHealthChanged = true;
+            healthLookup[castleEntity] = castleHealth;
         }
     }
 }
